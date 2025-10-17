@@ -140,6 +140,8 @@ $string['notification_grading_failed'] = 'AI grading failed for {$a->count} subm
 $string['notification_subject'] = 'AI Auto-Grading Report';
 
 // Course Transcript
+$string['course_context'] = 'Course Context';
+$string['course_context_desc'] = 'Course transcript in AI grading prompts for better context';
 $string['course_transcript'] = 'Course Transcript';
 $string['course_transcript_desc'] = 'Upload course transcript, syllabus, or lecture notes to provide context for AI grading';
 $string['course_transcript_text'] = 'Course Transcript (Text)';
@@ -148,3 +150,7 @@ $string['course_transcript_file'] = 'Course Transcript (File)';
 $string['course_transcript_file_desc'] = 'Upload PDF/DOCX of course transcript or syllabus';
 $string['use_course_transcript'] = 'Use Course Transcript for Context';
 $string['use_course_transcript_desc'] = 'Include course transcript in AI grading prompts for better context';
+
+// Notifications
+$string['notification_subject'] = 'Assignment Graded by AI';
+$string['notification_grading_complete'] = 'Your assignment has been automatically graded';
