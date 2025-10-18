@@ -4,6 +4,8 @@
 // ==============================================================================
 namespace local_ai_autograder;
 
+use grade_item;
+
 defined('MOODLE_INTERNAL') || die();
 
 class grading_handler {
@@ -256,6 +258,7 @@ class grading_handler {
     /**
      * Build ranged rubric grading prompt with correct understanding of the structure
      */
+  
     private function build_ranged_rubric_prompt($data) {
         global $CFG;
         require_once($CFG->dirroot . '/local/ai_autograder/classes/rubric_parser.php');
@@ -295,10 +298,10 @@ class grading_handler {
         $total_max_score = 0;
         
         foreach ($rubric_data['criteria'] as $criterion) {
-            $prompt .= "**{$criterion['description']}**\n";
+            // CRITICAL: Include the actual database ID in the prompt
+            $prompt .= "**Criterion ID {$criterion['id']}: {$criterion['description']}**\n";
             
             if (!empty($criterion['ranges'])) {
-                // Find the max score for this criterion
                 $criterion_max = 0;
                 foreach ($criterion['ranges'] as $range) {
                     if ($range['max_score'] > $criterion_max) {
@@ -326,15 +329,20 @@ class grading_handler {
         $prompt .= "1. For each criterion, read the performance level descriptions\n";
         $prompt .= "2. Determine which performance level best describes the student's work\n";
         $prompt .= "3. Assign a specific score within that performance level's range based on the quality\n";
-        $prompt .= "4. You can assign ANY integer score within the range (e.g., 13, 16, 18, etc.).  No decimals\n";
+        $prompt .= "4. You can assign ANY integer score within the range (e.g., 13, 16, 18, etc.). No decimals\n";
         $prompt .= "5. Higher scores within a range indicate better performance in that level\n";
         $prompt .= "6. Provide specific feedback explaining your score choice\n\n";
+        
+        $prompt .= "**CRITICAL: Use the EXACT criterion IDs shown above in your response**\n\n";
         
         $prompt .= "**Required JSON Response Format:**\n";
         $prompt .= "{\n";
         $prompt .= '  "criteria_scores": [' . "\n";
+        
+        // Show example with actual IDs
+        $first_criterion = reset($rubric_data['criteria']);
         $prompt .= '    {' . "\n";
-        $prompt .= '      "criterion_id": <criterion_id_number>,' . "\n";
+        $prompt .= '      "criterion_id": ' . $first_criterion['id'] . ',' . "\n";
         $prompt .= '      "score": <integer_score_within_range>,' . "\n";
         $prompt .= '      "feedback": "<specific_feedback_for_this_criterion>"' . "\n";
         $prompt .= '    },' . "\n";
@@ -343,18 +351,18 @@ class grading_handler {
         $prompt .= '  "overall_feedback": "<comprehensive_summary_feedback>"' . "\n";
         $prompt .= "}\n\n";
         
-        $prompt .= "**Example:** If a criterion has ranges like:\n";
-        $prompt .= "- Excellent (18 - 20 points)\n";
-        $prompt .= "- Good (15 - 17 points)\n";
-        $prompt .= "- Satisfactory (10 - 14 points)\n";
-        $prompt .= "- Needs Improvement (0 - 9 points)\n\n";
+        $prompt .= "**Example Response Structure:**\n";
+        $prompt .= "{\n";
+        $prompt .= '  "criteria_scores": [' . "\n";
+        foreach ($rubric_data['criteria'] as $criterion) {
+            $prompt .= '    {"criterion_id": ' . $criterion['id'] . ', "score": <score>, "feedback": "<feedback>"},' . "\n";
+        }
+        $prompt = rtrim($prompt, ",\n") . "\n";
+        $prompt .= "  ],\n";
+        $prompt .= '  "overall_feedback": "<summary>"' . "\n";
+        $prompt .= "}\n\n";
         
-        $prompt .= "You might assign:\n";
-        $prompt .= "- 19 for work that is excellent but not quite perfect\n";
-        $prompt .= "- 16 for work that is clearly good but has minor issues\n";
-        $prompt .= "- 12 for work that meets basic requirements but lacks depth\n\n";
-        
-        $prompt .= "Be precise and fair in your scoring. The integer precision allows for nuanced evaluation.";
+        $prompt .= "Remember: Use the EXACT criterion IDs (" . implode(', ', array_column($rubric_data['criteria'], 'id')) . ") in your response.";
         
         return $prompt;
     }
@@ -486,57 +494,75 @@ class grading_handler {
         ];
     }
     
+   /**
+     * Process ranged rubric response with ID validation
+     */
     private function process_ranged_rubric_response($response, $assignment) {
+        global $CFG;
+        require_once($CFG->dirroot . '/local/ai_autograder/classes/rubric_parser.php');
+        
         $criteria_scores = $response['criteria_scores'] ?? [];
         $total_score = 0;
         $formatted_scores = [];
         
-        foreach ($criteria_scores as $criterion) {
-            $score = $criterion['score'] ?? 0;
+        // Get the actual rubric data to validate criterion IDs
+        $parser = new rubric_parser();
+        $rubric_data = $parser->get_ranged_rubric_data($assignment);
+        $valid_criterion_ids = array_column($rubric_data['criteria'], 'id');
+        
+        debugging("Valid criterion IDs for this rubric: " . implode(', ', $valid_criterion_ids), DEBUG_DEVELOPER);
+        debugging("AI provided " . count($criteria_scores) . " criterion scores", DEBUG_DEVELOPER);
+        
+        foreach ($criteria_scores as $index => $criterion) {
+            $ai_criterion_id = $criterion['criterion_id'] ?? 0;
+            $score = (int)round($criterion['score'] ?? 0);
+            
+            debugging("Processing AI criterion {$ai_criterion_id} with score {$score}", DEBUG_DEVELOPER);
+            
+            // Validate that the AI provided a valid criterion ID
+            if (!in_array($ai_criterion_id, $valid_criterion_ids)) {
+                debugging("WARNING: AI provided invalid criterion ID {$ai_criterion_id}. Valid IDs are: " . implode(', ', $valid_criterion_ids), DEBUG_DEVELOPER);
+                
+                // Try to map by position if AI used sequential IDs
+                if ($ai_criterion_id > 0 && $ai_criterion_id <= count($valid_criterion_ids)) {
+                    $correct_criterion_id = $valid_criterion_ids[$ai_criterion_id - 1];
+                    debugging("Mapping AI criterion {$ai_criterion_id} to database criterion {$correct_criterion_id}", DEBUG_DEVELOPER);
+                    $ai_criterion_id = $correct_criterion_id;
+                } else {
+                    debugging("ERROR: Cannot map criterion ID {$ai_criterion_id}", DEBUG_DEVELOPER);
+                    continue;
+                }
+            }
+            
             $total_score += $score;
             
-            // Ensure we have the required fields for ranged rubric
             $formatted_scores[] = [
-                'criterion_id' => $criterion['criterion_id'] ?? $criterion['criterionid'] ?? 0,
+                'criterion_id' => $ai_criterion_id, // Use the validated/corrected ID
                 'score' => $score,
-                'feedback' => $criterion['feedback'] ?? $criterion['detailed_feedback'] ?? ''
+                'feedback' => $criterion['feedback'] ?? ''
             ];
+            
+            debugging("Formatted score: criterion {$ai_criterion_id}, score {$score}", DEBUG_DEVELOPER);
         }
         
         $feedback = $response['overall_feedback'] ?? '';
-
-        // FORMAT FEEDBACK WITH HTML
+        
+        // Format feedback with HTML
         $formatted_feedback = $this->format_feedback_html($feedback);
         
-        if (isset($response['strengths']) && is_array($response['strengths'])) {
-            $formatted_feedback .= "<br><br><strong>Strengths:</strong><br>";
-            $formatted_feedback .= "<ul>";
-            foreach ($response['strengths'] as $strength) {
-                $formatted_feedback .= "<li>" . htmlspecialchars($strength) . "</li>";
-            }
-            $formatted_feedback .= "</ul>";
-        }
-        
-        if (isset($response['improvements']) && is_array($response['improvements'])) {
-            $formatted_feedback .= "<br><strong>Areas for Improvement:</strong><br>";
-            $formatted_feedback .= "<ul>";
-            foreach ($response['improvements'] as $improvement) {
-                $formatted_feedback .= "<li>" . htmlspecialchars($improvement) . "</li>";
-            }
-            $formatted_feedback .= "</ul>";
-        }
-        
-        // Add criterion-specific feedback to overall feedback
+        // Add criterion-specific feedback
         if (!empty($formatted_scores)) {
-            $feedback .= "\n\n**Criterion Scores:**\n";
+            $formatted_feedback .= "<br><br><strong>Criterion Scores:</strong><br>";
             foreach ($formatted_scores as $score) {
-                $feedback .= sprintf(
-                    "- %s (Score: %.2f)\n",
-                    $score['feedback'],
+                $formatted_feedback .= sprintf(
+                    "- %s (Score: %d)<br>",
+                    htmlspecialchars($score['feedback']),
                     $score['score']
                 );
             }
         }
+        
+        debugging("Final total score: {$total_score}, formatted scores count: " . count($formatted_scores), DEBUG_DEVELOPER);
         
         return [
             'grade' => min($total_score, $assignment->grade),
@@ -544,12 +570,55 @@ class grading_handler {
             'criteria_scores' => $formatted_scores
         ];
     }
+
+
+    /**
+ * Map AI criterion IDs to database IDs if needed
+ */
+private function map_criterion_ids($ai_scores, $assignment) {
+    global $CFG;
+    require_once($CFG->dirroot . '/local/ai_autograder/classes/rubric_parser.php');
+    
+    $parser = new rubric_parser();
+    $rubric_data = $parser->get_ranged_rubric_data($assignment);
+    $db_criteria = $rubric_data['criteria'];
+    
+    $mapped_scores = [];
+    
+    foreach ($ai_scores as $index => $score) {
+        $ai_criterion_id = $score['criterion_id'] ?? 0;
+        
+        // If AI used correct database ID, keep it
+        $criterion_found = false;
+        foreach ($db_criteria as $db_criterion) {
+            if ($db_criterion['id'] == $ai_criterion_id) {
+                $mapped_scores[] = $score;
+                $criterion_found = true;
+                break;
+            }
+        }
+        
+        // If not found, try to map by position
+        if (!$criterion_found && $ai_criterion_id > 0 && $ai_criterion_id <= count($db_criteria)) {
+            $db_criterion = $db_criteria[$ai_criterion_id - 1];
+            $score['criterion_id'] = $db_criterion['id'];
+            $mapped_scores[] = $score;
+            debugging("Mapped AI criterion {$ai_criterion_id} to DB criterion {$db_criterion['id']}", DEBUG_DEVELOPER);
+        }
+    }
+    
+    return $mapped_scores;
+}
+
     
     /**
-     * Save grade to database
+     * Save grade with proper controller integration
      */
-   /* public function save_grade($assignment, $submission, $grade, $feedback, $criteria_scores = []) {
-        global $DB, $USER;
+    
+    public function save_grade($assignment, $submission, $grade, $feedback, $criteria_scores = []) {
+        global $DB, $USER, $CFG;
+        
+        debugging("=== Starting complete grade save ===", DEBUG_DEVELOPER);
         
         // Ensure assignment has cmid
         if (!isset($assignment->cmid)) {
@@ -559,101 +628,19 @@ class grading_handler {
             }
         }
         
-        // Save main grade
-        $grade_record = $DB->get_record('assign_grades', [
-            'assignment' => $assignment->id,
-            'userid' => $submission->userid,
-            'attemptnumber' => $submission->attemptnumber
-        ]);
+        $final_grade = (int)round($grade);
         
-        if ($grade_record) {
-            $grade_record->grade = $grade;
-            $grade_record->grader = $USER->id;
-            $grade_record->timemodified = time();
-            $DB->update_record('assign_grades', $grade_record);
-        } else {
-            $grade_record = new \stdClass();
-            $grade_record->assignment = $assignment->id;
-            $grade_record->userid = $submission->userid;
-            $grade_record->attemptnumber = $submission->attemptnumber;
-            $grade_record->timecreated = time();
-            $grade_record->timemodified = time();
-            $grade_record->grader = $USER->id;
-            $grade_record->grade = $grade;
-            $DB->insert_record('assign_grades', $grade_record);
-        }
-        
-        // Save feedback
-        $this->save_feedback($assignment, $submission, $feedback);
-        
-        // Save rubric scores if applicable
+        // Step 1: Save rubric scores (this handles instance status management)
+        $calculated_grade = $final_grade;
         if (!empty($criteria_scores)) {
-            $this->save_rubric_scores($assignment, $submission, $criteria_scores);
+            $calculated_grade = $this->save_rubric_scores($assignment, $submission, $criteria_scores);
+            if ($calculated_grade !== null) {
+                $final_grade = (int)round($calculated_grade);
+            }
+            debugging("Used calculated grade from rubric: $final_grade", DEBUG_DEVELOPER);
         }
-    }*/
-    
-   /**
- * Save grade to database with proper feedback handling
- */
-public function save_grade($assignment, $submission, $grade, $feedback, $criteria_scores = []) {
-    global $DB, $USER;
-    
-    debugging("Saving grade: Assignment ID {$assignment->id}, Submission ID {$submission->id}, Grade: $grade", DEBUG_DEVELOPER);
-    
-    // Ensure assignment has cmid
-    if (!isset($assignment->cmid)) {
-        $cm = get_coursemodule_from_instance('assign', $assignment->id);
-        if ($cm) {
-            $assignment->cmid = $cm->id;
-        }
-    }
-    
-    // Save main grade first
-    $grade_record = $DB->get_record('assign_grades', [
-        'assignment' => $assignment->id,
-        'userid' => $submission->userid,
-        'attemptnumber' => $submission->attemptnumber ?? 0
-    ]);
-    
-    if ($grade_record) {
-        debugging("Updating existing grade record ID: {$grade_record->id}", DEBUG_DEVELOPER);
-        $grade_record->grade = $grade;
-        $grade_record->grader = $USER->id;
-        $grade_record->timemodified = time();
-        $DB->update_record('assign_grades', $grade_record);
-        $grade_id = $grade_record->id;
-    } else {
-        debugging("Creating new grade record", DEBUG_DEVELOPER);
-        $grade_record = new \stdClass();
-        $grade_record->assignment = $assignment->id;
-        $grade_record->userid = $submission->userid;
-        $grade_record->attemptnumber = $submission->attemptnumber ?? 0;
-        $grade_record->timecreated = time();
-        $grade_record->timemodified = time();
-        $grade_record->grader = $USER->id;
-        $grade_record->grade = $grade;
-        $grade_id = $DB->insert_record('assign_grades', $grade_record);
-    }
-    
-    // Save feedback using the correct grade ID
-    $this->save_feedback($assignment, $submission, $feedback, $grade_id);
-    
-    // Save rubric scores if applicable
-    if (!empty($criteria_scores)) {
-        $this->save_rubric_scores($assignment, $submission, $criteria_scores);
-    }
-}
-
-/**
- * Save feedback to assignfeedback_comments table
- */
-private function save_feedback($assignment, $submission, $feedback, $grade_id = null) {
-    global $DB;
-    
-    debugging("Saving feedback for assignment {$assignment->id}, submission {$submission->id}", DEBUG_DEVELOPER);
-    
-    // If grade_id not provided, try to get it
-    if (!$grade_id) {
+        
+        // Step 2: Update assign_grades table
         $grade_record = $DB->get_record('assign_grades', [
             'assignment' => $assignment->id,
             'userid' => $submission->userid,
@@ -661,42 +648,177 @@ private function save_feedback($assignment, $submission, $feedback, $grade_id = 
         ]);
         
         if ($grade_record) {
+            $grade_record->grade = $final_grade;
+            $grade_record->grader = $USER->id;
+            $grade_record->timemodified = time();
+            $DB->update_record('assign_grades', $grade_record);
             $grade_id = $grade_record->id;
         } else {
-            debugging("No grade record found for feedback", DEBUG_DEVELOPER);
+            $grade_record = new \stdClass();
+            $grade_record->assignment = $assignment->id;
+            $grade_record->userid = $submission->userid;
+            $grade_record->attemptnumber = $submission->attemptnumber ?? 0;
+            $grade_record->timecreated = time();
+            $grade_record->timemodified = time();
+            $grade_record->grader = $USER->id;
+            $grade_record->grade = $final_grade;
+            $grade_id = $DB->insert_record('assign_grades', $grade_record);
+        }
+        
+        // Step 3: Save feedback
+        $this->save_feedback($assignment, $submission, $feedback, $grade_id);
+        
+        // Step 4: Update gradebook (this updates mdl_grade_grades and history)
+        $this->update_gradebook($assignment, $submission, $final_grade);
+        
+        // Step 5: Trigger assignment grade update for full consistency
+        require_once($CFG->dirroot . '/mod/assign/locallib.php');
+        $cm = get_coursemodule_from_instance('assign', $assignment->id);
+        $context = \context_module::instance($cm->id);
+        $assign = new \assign($context, $cm, $assignment->course);
+        
+        $grade_obj = (object)[
+            'userid' => $submission->userid,
+            'grade' => $final_grade,
+            'attemptnumber' => $submission->attemptnumber ?? 0
+        ];
+        
+        $assign->update_grade($grade_obj);
+        debugging("Triggered assign->update_grade for full consistency", DEBUG_DEVELOPER);
+        
+        debugging("=== Complete grade save finished ===", DEBUG_DEVELOPER);
+        return true;
+    }
+
+
+    /**
+     * Update the gradebook with the new grade
+     */
+ 
+    private function update_gradebook($assignment, $submission, $grade) {
+        global $CFG, $DB;
+        
+        debugging("Updating gradebook with grade: $grade", DEBUG_DEVELOPER);
+        
+        require_once($CFG->libdir . '/gradelib.php');
+        
+        try {
+            // Method 1: Use the grade_update function (recommended)
+            $grade_item = grade_item::fetch([
+                'itemtype' => 'mod',
+                'itemmodule' => 'assign',
+                'iteminstance' => $assignment->id
+            ]);
+            
+            if (!$grade_item) {
+                debugging("Could not find grade item for assignment {$assignment->id}", DEBUG_DEVELOPER);
+                return false;
+            }
+            
+            debugging("Found grade item: id={$grade_item->id}, grademax={$grade_item->grademax}", DEBUG_DEVELOPER);
+            
+            // Scale the grade to match the grade item's scale
+            $scaled_grade = ($grade / $assignment->grade) * $grade_item->grademax;
+            debugging("Scaled grade: $scaled_grade (from $grade)", DEBUG_DEVELOPER);
+            
+            // Prepare grade update data
+            $grades = new \stdClass();
+            $grades->userid = $submission->userid;
+            $grades->rawgrade = $scaled_grade;
+            $grades->feedback = null; // Feedback is handled separately
+            $grades->feedbackformat = FORMAT_HTML;
+            $grades->dategraded = time();
+            
+            // Use grade_update - this handles history automatically
+            $result = grade_update(
+                'mod/assign',           // source
+                $assignment->course,    // courseid  
+                'mod',                  // itemtype
+                'assign',               // itemmodule
+                $assignment->id,        // iteminstance
+                0,                      // itemnumber
+                $grades,                // grades object
+                null                    // itemdetails
+            );
+            
+            if ($result == GRADE_UPDATE_OK) {
+                debugging("Grade updated successfully via grade_update", DEBUG_DEVELOPER);
+                
+                // Verify the grade was saved
+                $saved_grade = $DB->get_record('grade_grades', [
+                    'itemid' => $grade_item->id,
+                    'userid' => $submission->userid
+                ]);
+                
+                if ($saved_grade) {
+                    debugging("Verified grade in gradebook: finalgrade={$saved_grade->finalgrade}, rawgrade={$saved_grade->rawgrade}", DEBUG_DEVELOPER);
+                }
+                
+                return true;
+            } else {
+                debugging("grade_update failed with result: $result", DEBUG_DEVELOPER);
+                return false;
+            }
+            
+        } catch (\Exception $e) {
+            debugging("Exception in gradebook update: " . $e->getMessage(), DEBUG_DEVELOPER);
             return false;
         }
     }
-    
-    // Check if feedback record already exists
-    $feedback_record = $DB->get_record('assignfeedback_comments', [
-        'assignment' => $assignment->id,
-        'grade' => $grade_id
-    ]);
-    
-    $feedback_text = "🤖 <strong>AI-Generated Feedback</strong><br><br>" . $feedback;
-    
-    if ($feedback_record) {
-        $feedback_record->commenttext = $feedback_text;
-        $feedback_record->commentformat = FORMAT_HTML; // CHANGED from 1 to FORMAT_HTML
-        $result = $DB->update_record('assignfeedback_comments', $feedback_record);
-    } else {
-        $feedback_record = new \stdClass();
-        $feedback_record->assignment = $assignment->id;
-        $feedback_record->grade = $grade_id;
-        $feedback_record->commenttext = $feedback_text;
-        $feedback_record->commentformat = FORMAT_HTML; // CHANGED from 1 to FORMAT_HTML
-        $result = $DB->insert_record('assignfeedback_comments', $feedback_record);
+
+    /**
+     * Save feedback to assignfeedback_comments table
+     */
+    private function save_feedback($assignment, $submission, $feedback, $grade_id = null) {
+        global $DB;
+        
+        debugging("Saving feedback for assignment {$assignment->id}, submission {$submission->id}", DEBUG_DEVELOPER);
+        
+        // If grade_id not provided, try to get it
+        if (!$grade_id) {
+            $grade_record = $DB->get_record('assign_grades', [
+                'assignment' => $assignment->id,
+                'userid' => $submission->userid,
+                'attemptnumber' => $submission->attemptnumber ?? 0
+            ]);
+            
+            if ($grade_record) {
+                $grade_id = $grade_record->id;
+            } else {
+                debugging("No grade record found for feedback", DEBUG_DEVELOPER);
+                return false;
+            }
+        }
+        
+        // Check if feedback record already exists
+        $feedback_record = $DB->get_record('assignfeedback_comments', [
+            'assignment' => $assignment->id,
+            'grade' => $grade_id
+        ]);
+        
+        $feedback_text = "🤖 <strong>AI-Generated Feedback</strong><br><br>" . $feedback;
+        
+        if ($feedback_record) {
+            $feedback_record->commenttext = $feedback_text;
+            $feedback_record->commentformat = FORMAT_HTML; // CHANGED from 1 to FORMAT_HTML
+            $result = $DB->update_record('assignfeedback_comments', $feedback_record);
+        } else {
+            $feedback_record = new \stdClass();
+            $feedback_record->assignment = $assignment->id;
+            $feedback_record->grade = $grade_id;
+            $feedback_record->commenttext = $feedback_text;
+            $feedback_record->commentformat = FORMAT_HTML; // CHANGED from 1 to FORMAT_HTML
+            $result = $DB->insert_record('assignfeedback_comments', $feedback_record);
+        }
+        
+        if ($result) {
+            debugging("Feedback saved successfully", DEBUG_DEVELOPER);
+        } else {
+            debugging("Failed to save feedback", DEBUG_DEVELOPER);
+        }
+        
+        return $result;
     }
-    
-    if ($result) {
-        debugging("Feedback saved successfully", DEBUG_DEVELOPER);
-    } else {
-        debugging("Failed to save feedback", DEBUG_DEVELOPER);
-    }
-    
-    return $result;
-}
     
     /**
      * Save rubric scores to database
@@ -705,42 +827,121 @@ private function save_feedback($assignment, $submission, $feedback, $grade_id = 
      * @param object $submission Submission record
      * @param array $criteria_scores Array of criterion scores from AI
      */
+    
+
     private function save_rubric_scores($assignment, $submission, $criteria_scores) {
-        global $DB;
+        global $DB, $USER, $CFG;
         
         if (empty($criteria_scores)) {
             return;
         }
         
-        // Get grading method
-        $grading_method = \local_ai_autograder\ai_service::get_grading_method($assignment);
+        debugging("Saving rubric scores with status management", DEBUG_DEVELOPER);
         
-        // Get or create grading instance
-        $instance = $this->get_or_create_grading_instance($assignment, $submission);
+        $grading_method = \local_ai_autograder\ai_service::get_grading_method($assignment);
+        if ($grading_method !== 'ranged_rubric') {
+            return;
+        }
+        
+        // Get the controller
+        require_once($CFG->dirroot . '/grade/grading/lib.php');
+        $context = \context_module::instance($assignment->cmid);
+        $gradingmanager = get_grading_manager($context, 'mod_assign', 'submissions');
+        $controller = $gradingmanager->get_controller($gradingmanager->get_active_method());
+        
+        if (!$controller) {
+            throw new \Exception('Could not get grading controller');
+        }
+        
+        // CRITICAL: Mark all existing instances for this submission as NEEDUPDATE
+        $definition_id = $controller->get_definition()->id;
+        $existing_instances = $DB->get_records('grading_instances', [
+            'definitionid' => $definition_id,
+            'itemid' => $submission->id,
+            'status' => 1 // Currently active instances
+        ]);
+        
+        foreach ($existing_instances as $old_instance) {
+            $DB->update_record('grading_instances', (object)[
+                'id' => $old_instance->id,
+                'status' => 2, // NEEDUPDATE - this marks old instances as superseded
+                'timemodified' => time()
+            ]);
+            debugging("Marked old instance {$old_instance->id} as NEEDUPDATE", DEBUG_DEVELOPER);
+        }
+        
+        // Create new instance through controller
+        $instance = $controller->get_or_create_instance(0, $USER->id, $submission->id);
         
         if (!$instance) {
-            throw new \Exception('Could not create grading instance');
+            throw new \Exception('Could not create controller instance');
         }
         
-        // Save based on grading method
-        if ($grading_method == 'ranged_rubric') {
-            $this->save_ranged_rubric_scores($instance->id, $criteria_scores);
-        } else {
-            $this->save_standard_rubric_scores($instance->id, $criteria_scores);
+        debugging("Created new instance: " . $instance->get_id(), DEBUG_DEVELOPER);
+        
+        // Prepare form data
+        $form_data = ['criteria' => []];
+        
+        foreach ($criteria_scores as $score) {
+            $criterion_id = $score['criterion_id'];
+            $assigned_score = (int)round($score['score']);
+            $feedback = $score['feedback'] ?? '';
+            
+            // Get appropriate level
+            $levels = $DB->get_records('gradingform_rubric_ranges_l', 
+                ['criterionid' => $criterion_id], 'score DESC');
+            
+            if (!empty($levels)) {
+                $selected_level_id = null;
+                foreach ($levels as $level) {
+                    if ($assigned_score >= $level->score) {
+                        $selected_level_id = $level->id;
+                        break;
+                    }
+                }
+                
+                if (!$selected_level_id) {
+                    $lowest_level = end($levels);
+                    $selected_level_id = $lowest_level->id;
+                }
+                
+                $form_data['criteria'][$criterion_id] = [
+                    'levelid' => $selected_level_id,
+                    'grade' => $assigned_score,
+                    'remark' => $feedback
+                ];
+            }
         }
+        
+        // Update the instance
+        $instance->update($form_data);
+        
+        // Calculate final grade
+        $calculated_grade = $instance->get_grade();
+        debugging("Calculated grade from instance: $calculated_grade", DEBUG_DEVELOPER);
+        
+        // CRITICAL: Set the new instance as ACTIVE
+        $DB->update_record('grading_instances', (object)[
+            'id' => $instance->get_id(),
+            'status' => 1, // ACTIVE - this makes the frontend show this instance
+            'rawgrade' => $calculated_grade,
+            'timemodified' => time()
+        ]);
+        
+        debugging("Set new instance {$instance->get_id()} as ACTIVE", DEBUG_DEVELOPER);
+        
+        return $calculated_grade;
     }
-    
+
     /**
-     * Get or create a grading instance
-     * 
-     * @param object $assignment
-     * @param object $submission
-     * @return object|false Grading instance
+     * Create grading instance directly via database (creates versioning like standard behavior)
      */
-    private function get_or_create_grading_instance($assignment, $submission) {
+    private function create_grading_instance_direct($assignment, $submission) {
         global $DB, $USER;
         
-        // Get grading area
+        debugging("Creating grading instance directly", DEBUG_DEVELOPER);
+        
+        // Get grading definition
         $context = \context_module::instance($assignment->cmid);
         $grading_area = $DB->get_record('grading_areas', [
             'contextid' => $context->id,
@@ -749,157 +950,45 @@ private function save_feedback($assignment, $submission, $feedback, $grade_id = 
         ]);
         
         if (!$grading_area) {
+            debugging("No grading area found", DEBUG_DEVELOPER);
             return false;
         }
         
-        // Get grading definition
         $definition = $DB->get_record('grading_definitions', [
             'areaid' => $grading_area->id
         ]);
         
         if (!$definition) {
+            debugging("No grading definition found", DEBUG_DEVELOPER);
             return false;
         }
         
-        // Check if instance already exists
-        $instance = $DB->get_record('grading_instances', [
-            'definitionid' => $definition->id,
-            'itemid' => $submission->id
-        ]);
+        debugging("Found definition: {$definition->id}, method: {$definition->method}", DEBUG_DEVELOPER);
         
-        if ($instance) {
-            return $instance;
-        }
-        
-        // Create new instance
+        // Create new instance (this mimics the standard versioning behavior)
+        // Each grading attempt gets a new instance, which is what creates the versioning
         $instance = new \stdClass();
         $instance->definitionid = $definition->id;
         $instance->raterid = $USER->id;
         $instance->itemid = $submission->id;
-        $instance->rawgrade = null; // Will be calculated
-        $instance->status = 0;
+        $instance->rawgrade = null; // Will be set after calculating total
+        $instance->status = 0; // INCOMPLETE initially
         $instance->feedback = null;
         $instance->feedbackformat = 0;
         $instance->timemodified = time();
         
-        $instance->id = $DB->insert_record('grading_instances', $instance);
-        
-        return $instance;
+        try {
+            $instance->id = $DB->insert_record('grading_instances', $instance);
+            debugging("Successfully created grading instance: {$instance->id}", DEBUG_DEVELOPER);
+            return $instance;
+        } catch (\Exception $e) {
+            debugging("Failed to create grading instance: " . $e->getMessage(), DEBUG_DEVELOPER);
+            return false;
+        }
     }
     
-   /**
-     * Save ranged rubric scores using correct table structure
-     * 
-     * @param int $instanceid Grading instance ID
-     * @param array $criteria_scores Array of criterion scores
-     */
-    private function save_ranged_rubric_scores($instanceid, $criteria_scores) {
-        global $DB;
-        
-        debugging("Saving ranged rubric scores for instance $instanceid", DEBUG_DEVELOPER);
-        debugging("Received " . count($criteria_scores) . " criterion scores", DEBUG_DEVELOPER);
-        
-        // Delete existing fillings for this instance
-        $deleted = $DB->delete_records('gradingform_rubric_ranges_f', ['instanceid' => $instanceid]);
-        debugging("Deleted $deleted existing filling records", DEBUG_DEVELOPER);
-
-        // Validate that all criterion IDs exist in the current rubric definition
-        $valid_criterion_ids = array_keys($this->get_rubric_definition_criteria($instanceid));
-        debugging("Valid criterion IDs for this rubric: " . implode(', ', $valid_criterion_ids), DEBUG_DEVELOPER);
-        
-        foreach ($criteria_scores as $criterion_score) {
-
-            $criterion_id = $criterion_score['criterion_id'];
-            
-            // VALIDATE CRITERION ID
-            if (!in_array($criterion_id, $valid_criterion_ids)) {
-                debugging("ERROR: Invalid criterion ID $criterion_id. Skipping.", DEBUG_DEVELOPER);
-                continue;
-            }
-
-            if (!isset($criterion_score['criterion_id']) || !isset($criterion_score['score'])) {
-                debugging("Skipping criterion score due to missing criterion_id or score", DEBUG_DEVELOPER);
-                continue;
-            }
-            
-            $assigned_grade = (float)$criterion_score['score'];
-            $feedback = $criterion_score['feedback'] ?? '';
-            
-            debugging("Processing criterion $criterion_id with assigned score $assigned_grade", DEBUG_DEVELOPER);
-            
-            // Get all levels for this criterion - FIXED: using correct column 'score'
-            $levels = $DB->get_records('gradingform_rubric_ranges_l', 
-                ['criterionid' => $criterion_id], 
-                'score DESC'); // FIXED: Order by 'score' not 'scoremin'
-            
-            if (empty($levels)) {
-                debugging("ERROR: No levels found for criterion $criterion_id", DEBUG_DEVELOPER);
-                continue;
-            }
-            
-            debugging("Found " . count($levels) . " levels for criterion $criterion_id", DEBUG_DEVELOPER);
-            
-            // Find the appropriate level based on score
-            $selected_level_id = null;
-            $level_array = array_values($levels);
-            
-            for ($i = 0; $i < count($level_array); $i++) {
-                $current_level = $level_array[$i];
-                $next_level = isset($level_array[$i + 1]) ? $level_array[$i + 1] : null;
-                
-                // Calculate the range for this level
-                $max_score = (float)$current_level->score;
-                $min_score = $next_level ? ((float)$next_level->score + 0.01) : 0.0;
-                
-                debugging("Checking level {$current_level->id}: range {$min_score} - {$max_score} (assigned: {$assigned_grade})", DEBUG_DEVELOPER);
-                
-                // Check if the assigned grade falls within this level's range
-                if ($assigned_grade <= $max_score && $assigned_grade >= $min_score) {
-                    $selected_level_id = $current_level->id;
-                    debugging("✅ Selected level {$selected_level_id} for score $assigned_grade", DEBUG_DEVELOPER);
-                    break;
-                }
-            }
-            
-            // If no level found, handle edge cases
-            if (!$selected_level_id) {
-                // Score might be higher than highest level - use highest level
-                if ($assigned_grade > $level_array[0]->score) {
-                    $selected_level_id = $level_array[0]->id;
-                    debugging("Score $assigned_grade exceeds highest level, using highest level {$selected_level_id}", DEBUG_DEVELOPER);
-                } 
-                // Score might be lower than lowest level - use lowest level
-                else {
-                    $lowest_level = end($level_array);
-                    $selected_level_id = $lowest_level->id;
-                    debugging("Score $assigned_grade below lowest level, using lowest level {$selected_level_id}", DEBUG_DEVELOPER);
-                }
-            }
-            
-            if ($selected_level_id) {
-                // Create filling record using correct table structure
-                $filling = new \stdClass();
-                $filling->instanceid = $instanceid;
-                $filling->criterionid = $criterion_id;
-                $filling->levelid = $selected_level_id;
-                $filling->grade = $assigned_grade; // IMPORTANT: This is the actual assigned score
-                $filling->remark = $feedback;
-                $filling->remarkformat = 0; // Plain text
-                
-                try {
-                    $filling_id = $DB->insert_record('gradingform_rubric_ranges_f', $filling);
-                    debugging("✅ Saved ranged rubric filling: ID $filling_id, criterion $criterion_id, level $selected_level_id, grade $assigned_grade", DEBUG_DEVELOPER);
-                } catch (\Exception $e) {
-                    debugging("❌ ERROR saving filling for criterion $criterion_id: " . $e->getMessage(), DEBUG_DEVELOPER);
-                }
-            } else {
-                debugging("❌ ERROR: Could not determine level for criterion $criterion_id with score $assigned_grade", DEBUG_DEVELOPER);
-            }
-        }
-        
-        debugging("Completed saving ranged rubric scores for instance $instanceid", DEBUG_DEVELOPER);
-    }
-
+    
+  
 
     /**
      * Get valid criterion IDs for the rubric instance
