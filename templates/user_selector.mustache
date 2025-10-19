@@ -1,0 +1,73 @@
+<div class="form-group">
+    <input type="hidden" name="{{name}}" id="{{name}}" value="{{value}}">
+    <input type="text" 
+           class="form-control user-selector-input" 
+           id="{{name}}_display"
+           placeholder="{{placeholder}}"
+           value="{{selecteduser}}"
+           data-target="{{name}}"
+           autocomplete="off">
+    <div id="{{name}}_results" class="dropdown-menu" style="display: none;"></div>
+</div>
+
+{{#js}}
+require(['core/notification', 'core/ajax'], function(notification, ajax) {
+    var input = document.getElementById('{{name}}_display');
+    var hidden = document.getElementById('{{name}}');
+    var results = document.getElementById('{{name}}_results');
+    var timeout;
+
+    input.addEventListener('input', function() {
+        clearTimeout(timeout);
+        var query = this.value;
+        
+        if (query.length < 2) {
+            results.style.display = 'none';
+            return;
+        }
+        
+        timeout = setTimeout(function() {
+            searchUsers(query);
+        }, 300);
+    });
+
+    function searchUsers(query) {
+        ajax.call([{
+            methodname: 'core_user_search_users',
+            args: {
+                query: query,
+                capability: '',
+                limitfrom: 0,
+                limitnum: 10
+            }
+        }])[0].then(function(users) {
+            results.innerHTML = '';
+            
+            if (users.list.length === 0) {
+                results.innerHTML = '<div class="dropdown-item">No users found</div>';
+            } else {
+                users.list.forEach(function(user) {
+                    var item = document.createElement('div');
+                    item.className = 'dropdown-item user-item';
+                    item.innerHTML = '<strong>' + user.fullname + '</strong><br><small>' + user.email + '</small>';
+                    item.addEventListener('click', function() {
+                        hidden.value = user.id;
+                        input.value = user.fullname + ' (' + user.email + ')';
+                        results.style.display = 'none';
+                    });
+                    results.appendChild(item);
+                });
+            }
+            
+            results.style.display = 'block';
+        }).catch(notification.exception);
+    }
+
+    // Hide results when clicking outside
+    document.addEventListener('click', function(e) {
+        if (!input.contains(e.target) && !results.contains(e.target)) {
+            results.style.display = 'none';
+        }
+    });
+});
+{{/js}}
